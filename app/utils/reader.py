@@ -1,35 +1,30 @@
 import csv
+
 import yaml
 
 from app.schemas.password import Password, PasswordList
 
 
-def read_passwords(path: str) -> PasswordList | None:
+def read_passwords(path: str) -> PasswordList:
     try:
-        with open(path) as f:
-            extension = path.split(".")[-1]
+        with open(path, encoding="utf-8") as file:
+            extension = path.split(".")[-1].lower()
+
             if extension == "json":
-                raw = f.read()
+                raw = file.read()
                 if not raw:
                     return PasswordList()
-                data = PasswordList.model_validate_json(raw)
-                return data
-            if extension in ["yml", "yaml"]:
-                data = yaml.safe_load(f)
-                return PasswordList.model_validate(data)
+                return PasswordList.model_validate_json(raw)
+
+            if extension in {"yml", "yaml"}:
+                data = yaml.safe_load(file)
+                return PasswordList.model_validate(data or {"passwords": []})
+
             if extension == "csv":
-                csv_reader = csv.reader(f, delimiter=";")
-                keys = []
-                data = PasswordList()
-                for rownum, row in enumerate(csv_reader):
-                    if rownum == 0:
-                        keys = row
-                        continue
-                    data.passwords.append(
-                        Password.model_validate(
-                            {key: row[keynum] for keynum, key in enumerate(keys)}
-                        )
-                    )
-                return data
+                reader = csv.DictReader(file, delimiter=";")
+                passwords = [Password.model_validate(row) for row in reader]
+                return PasswordList(passwords=passwords)
+
+            raise ValueError(f"Unsupported data type: {extension}")
     except FileNotFoundError:
         return PasswordList()

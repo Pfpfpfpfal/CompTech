@@ -1,5 +1,5 @@
 import asyncio
-import copy
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Callable
 import uuid
@@ -7,122 +7,116 @@ import uuid
 import jsondb
 
 from app.enums.data_types import DataType
-from app.schemas.password import Password, PasswordList, PasswordUpdate
+from app.schemas.password import Password, PasswordUpdate
 from app.settings import DATA_PATH
 from app.utils.reader import read_passwords
 from app.utils.writer import write_passwords
 
 
 class MyJsonDB(jsondb.JsonDB):
-    def __insert_into(self, data: list[dict[str, Any]], new_items: list[dict[str, Any]]) -> Any:
-        if not isinstance(new_items, list):
-            raise jsondb.exceptions.InvalidOperationError(
-                f"Cannot insert into data of type '{type(data).__name__}'. "
-                f"Only list appends and dict updates are supported."
-            )
-        new_table = data.copy()
-        new_table.extend(new_items)
-        return new_table
-    
-    def get_data(self, table_name: str = None, condition: Callable | None = None) -> Any:
-        if not table_name:
-            return super().get_data()
-        if not condition:
-            return super().get_data(table_name)
-        obj = next((data for data in self._data[table_name] if condition(data)), None)
-        if not obj:
-            return None
-        return copy.deepcopy(obj)
-        
-    
-    def insert_data(self, table_name: str, data: list[dict[str, Any]] | dict[str, Any]):
-        if isinstance(data, dict):
-            super().insert_data(table_name=table_name, data=data)
+    def ensure_table(self, table_name: str) -> None:
+        if self.table_exists(table_name):
             return
-        
-        if not self.table_exists(table_name):
-            self._data[table_name] = []
-
-        table = self.get_data(table_name) or []
-        if not isinstance(table, list):
-            raise jsondb.exceptions.InvalidOperationError(
-                f"Cannot insert list data into table '{table_name}' of type '{type(table).__name__}'."
-            )
-
-        self._data[table_name] = self.__insert_into(table, data)
+        self._data[table_name] = []
         self._save()
-        
+
+    def get_one(self, table_name: str, condition: Callable[[dict[str, Any]], bool]) -> dict[str, Any] | None:
+        data = self.get_data(table_name)
+        if not isinstance(data, list):
+            return None
+        item = next((row for row in data if condition(row)), None)
+        return deepcopy(item)
+
+    def append_many(self, table_name: str, items: list[dict[str, Any]]) -> None:
+        self.ensure_table(table_name)
+        data = self.get_data(table_name)
+        if not isinstance(data, list):
+            raise TypeError(f"Table '{table_name}' is not a list")
+        data.extend(items)
+        self._data[table_name] = data
+        self._save()
+
 
 class DB:
-    __instance = None
-    
+    _instance: "DB | None" = None
+
+    @classmethod
+    def instance(cls) -> "DB":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self) -> None:
+        self._db = MyJsonDB(file_path=DATA_PATH)
+        self._db.ensure_table("passwords")
+
     @staticmethod
-    def instance():
-        if not DB.__instance:
-            DB.__instance = DB()
-            DB.__instance._load()
-        return DB.__instance
-    
-    def __init__(self):
-        self.__db: MyJsonDB | None = None
-    
-    def _load(self):
-        self.__db = MyJsonDB(file_path=DATA_PATH)
-        
-    def __check(self, password_id: uuid.UUID, structure: list[dict[str, Any]] | dict[str, Any]) -> dict[str, Any] | None:
-        if structure.get("password_id") == str(password_id):
-            return structure
-        return None
-        
+    def _same_password_id(password_id: uuid.UUID, row: dict[str, Any]) -> bool:
+        return row.get("password_id") == str(password_id)
+
+    @property
+    def data(self) -> dict[str, Any]:
+        data = self._db.get_data()
+        if isinstance(data, dict):
+            return data
+        return {"passwords": []}
+
     def insert(self, data: Password) -> Password:
-        self.__db.insert_data("passwords", data=data.model_dump(mode="json"))
-    
-    @property    
-    def __data(self) -> Any:
-        data = self.__db.get_data()
+        self._db.append_many("passwords", [data.model_dump(mode="json")])
         return data
-        
+
     def get(self, password_id: uuid.UUID) -> Password | None:
-        db_object = self.__db.get_data("passwords", condition=lambda password: self.__check(password_id=password_id, structure=password))
-        if db_object:
-            return Password.model_validate(db_object)
-        return None
-        
+        row = self._db.get_one("passwords", lambda item: self._same_password_id(password_id, item))
+        if row is None:
+            return None
+        return Password.model_validate(row)
+
     def update(self, password_id: uuid.UUID, data: PasswordUpdate) -> Password | None:
-        update_pass = self.get(password_id=password_id)
-        if not update_pass:
+        current = self.get(password_id)
+        if current is None:
             return None
+
         for key, value in data.model_dump(exclude_unset=True).items():
-            setattr(update_pass, key, value)
-        self.__db.update_data("passwords", new_data=update_pass.model_dump(mode="json"), condition=lambda password: self.__check(password_id=password_id, structure=password))
-        return update_pass
-        
+            setattr(current, key, value)
+
+        self._db.update_data(
+            "passwords",
+            new_data=current.model_dump(mode="json"),
+            condition=lambda item: self._same_password_id(password_id, item),
+        )
+        return current
+
     def delete(self, password_id: uuid.UUID) -> Password | None:
-        delete_pass = self.get(password_id=password_id)
-        if not delete_pass:
+        current = self.get(password_id)
+        if current is None:
             return None
-        self.__db.delete_data("passwords", condition=lambda password: self.__check(password_id=password_id, structure=password))
-        return delete_pass
-    
-    def export_data(self, data_type: DataType | None = DataType.JSON):
+
+        self._db.delete_data("passwords", condition=lambda item: self._same_password_id(password_id, item))
+        return current
+
+    def export_data(self, data_type: DataType = DataType.JSON) -> str:
         extension = {
             DataType.JSON: "json",
             DataType.YAML: "yaml",
-            DataType.CSV: "csv"
-        }.get(data_type, "unknown")
-        # Windows does not allow ":" in file names.
+            DataType.CSV: "csv",
+        }.get(data_type, "json")
+
         timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")
-        write_passwords(
-            f"exported_{timestamp}.{extension}",
-            self.__data
-        )
-        
-    def import_data(self, path: str):
+        path = f"exported_{timestamp}.{extension}"
+        write_passwords(path, self.data)
+        return path
+
+    def import_data(self, path: str) -> int:
         async def dump_password(password: Password) -> dict[str, Any]:
             return password.model_dump(mode="json")
-        
+
         async def dump_passwords() -> list[dict[str, Any]]:
-            coros = [dump_password(password) for password in read_passwords(path=path).passwords]
-            return await asyncio.gather(*coros)
-        
-        self.__db.insert_data("passwords", data=asyncio.run(dump_passwords()))
+            password_list = read_passwords(path)
+            tasks = [dump_password(password) for password in password_list.passwords]
+            return await asyncio.gather(*tasks)
+
+        rows = asyncio.run(dump_passwords())
+        if not rows:
+            return 0
+        self._db.append_many("passwords", rows)
+        return len(rows)
