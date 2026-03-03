@@ -3,3 +3,4 @@
 !app/
 !app/**
 *.pyc
+!CompTech.ipynb
