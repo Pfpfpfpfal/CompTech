@@ -5,3 +5,4 @@
 *.pyc
 !CompTech.ipynb
 !requirements.txt
+!mngr_data.json
